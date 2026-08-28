@@ -346,3 +346,280 @@ describe("DefindexService.calculateWithdrawalParams", () => {
     ).rejects.toThrow(DefindexServiceError);
   });
 });
+
+describe("DefindexService.calculateDepositParams", () => {
+  const DEPOSIT_AMOUNT = "100000000"; // 10 USDC
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.DEFINDEX_VAULT_CONTRACT_ID = VAULT_CONTRACT_ID;
+    process.env.SOROBAN_RPC_URL = "https://fake-rpc.example.com";
+    delete process.env.STELLAR_NETWORK_PASSPHRASE;
+
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse());
+        case "balance_of":
+          return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
+        case "deposit":
+          return successResponse(
+            nativeToScVal(100n, { type: "i128" }),
+          );
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    delete process.env.SOROBAN_RPC_URL;
+  });
+
+  it("computes deposit parameters and returns an unsigned deposit XDR", async () => {
+    const result = await DefindexService.calculateDepositParams(
+      USER_ADDRESS,
+      DEPOSIT_AMOUNT,
+    );
+
+    expect(result.userAddress).toBe(USER_ADDRESS);
+    expect(result.amount).toBe(DEPOSIT_AMOUNT);
+    // 100_000_000 units / ($1000 USDC over 10k shares => 0.0001 USDC/share)
+    // estimatedShares = floor(amount * supply / managed)
+    expect(result.estimatedShares).toBe("100");
+    expect(result.sharePrice).toBe(EXPECTED_SHARE_PRICE.toString());
+    expect(result.userBalance).toBe(BALANCE_OF.toString());
+    expect(result.totalManagedFunds).toBe(TOTAL_MANAGED.toString());
+    expect(result.totalSupply).toBe(TOTAL_SUPPLY.toString());
+    expect(result.contractId).toBe(VAULT_CONTRACT_ID);
+    expect(result.rpcUrl).toBe("https://fake-rpc.example.com");
+    expect(result.unsignedXdr).toBeTruthy();
+    expect(result.txHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("builds a deposit invocation with the correct Soroban arguments", async () => {
+    const result = await DefindexService.calculateDepositParams(
+      USER_ADDRESS,
+      DEPOSIT_AMOUNT,
+    );
+
+    const envelope = xdr.TransactionEnvelope.fromXDR(
+      result.unsignedXdr,
+      "base64",
+    );
+    const hostFunction = hostFunctionOf(envelope);
+    const contractArgs = hostFunction.invokeContract();
+
+    expect(contractArgs.functionName().toString()).toBe("deposit");
+    expect(
+      StrKey.encodeContract(
+        contractArgs.contractAddress().contractId() as unknown as Buffer,
+      ),
+    ).toBe(VAULT_CONTRACT_ID);
+
+    const args = contractArgs.args();
+    expect(args).toHaveLength(2);
+
+    expect(args[0].switch().name).toBe("scvI128");
+    expect(scValToNative(args[0])).toBe(BigInt(DEPOSIT_AMOUNT));
+    expect(scValToNative(args[1])).toBe(USER_ADDRESS);
+  });
+
+  it("queries total_supply, managed funds and balance_of over Soroban RPC and simulates the deposit", async () => {
+    await DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT);
+
+    const simulatedMethods = mockSimulateTransaction.mock.calls.map(([tx]) =>
+      invokedMethod(tx),
+    );
+    expect(simulatedMethods).toEqual([
+      "total_supply",
+      "fetch_total_managed_funds",
+      "balance_of",
+      "deposit",
+    ]);
+  });
+
+  it("assumes a 1:1 share price when the vault is empty", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(0n, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse(0n));
+        case "balance_of":
+          return successResponse(nativeToScVal(0n, { type: "i128" }));
+        case "deposit":
+          return successResponse(
+            nativeToScVal(BigInt(DEPOSIT_AMOUNT), { type: "i128" }),
+          );
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+
+    const result = await DefindexService.calculateDepositParams(
+      USER_ADDRESS,
+      DEPOSIT_AMOUNT,
+    );
+
+    expect(result.sharePrice).toBe((10n ** 7n).toString());
+    expect(result.estimatedShares).toBe(DEPOSIT_AMOUNT);
+  });
+
+  it("throws for invalid amounts", async () => {
+    for (const amount of ["0", "-5", "abc", "1.5", ""]) {
+      await expect(
+        DefindexService.calculateDepositParams(USER_ADDRESS, amount),
+      ).rejects.toThrow(/Invalid deposit amount/);
+    }
+  });
+
+  it("throws for an invalid user address", async () => {
+    await expect(
+      DefindexService.calculateDepositParams("not-a-stellar-address", "100"),
+    ).rejects.toThrow(/Invalid user address/);
+  });
+
+  it("throws when the DeFindex vault contract id is not configured", async () => {
+    delete process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(/DEFINDEX_VAULT_CONTRACT_ID/);
+  });
+
+  it("throws when a contract query fails on the RPC", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      if (invokedMethod(tx) === "total_supply") {
+        return errorResponse("HostError: contract invocation failed");
+      }
+      throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+    });
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(/Failed to query total_supply/);
+  });
+
+  it("throws when the deposit simulation reports an error", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse());
+        case "balance_of":
+          return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
+        case "deposit":
+          return errorResponse("HostError: vault paused");
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(/Deposit simulation failed/);
+  });
+
+  it("falls back to the un-simulated XDR when the RPC is unreachable", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      if (invokedMethod(tx) === "deposit") {
+        throw new Error("network down");
+      }
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse());
+        case "balance_of":
+          return successResponse(nativeToScVal(BALANCE_OF, { type: "i128" }));
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+
+    const result = await DefindexService.calculateDepositParams(
+      USER_ADDRESS,
+      DEPOSIT_AMOUNT,
+    );
+
+    expect(result.estimatedShares).toBe("100");
+    const envelope = xdr.TransactionEnvelope.fromXDR(
+      result.unsignedXdr,
+      "base64",
+    );
+    expect(hostFunctionOf(envelope).invokeContract().functionName().toString()).toBe(
+      "deposit",
+    );
+  });
+
+  it("wraps unexpected errors in DefindexServiceError", async () => {
+    mockSimulateTransaction.mockRejectedValue(new Error("rpc exploded"));
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(DefindexServiceError);
+  });
+
+  it("throws when the vault has shares but no managed funds", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(TOTAL_SUPPLY, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse(0n));
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(
+      /has shares in circulation but manages no USDC funds/,
+    );
+  });
+
+  it("throws when the vault manages funds but has no shares", async () => {
+    mockSimulateTransaction.mockImplementation(async (tx: any) => {
+      switch (invokedMethod(tx)) {
+        case "total_supply":
+          return successResponse(nativeToScVal(0n, { type: "i128" }));
+        case "fetch_total_managed_funds":
+          return successResponse(managedFundsResponse());
+        default:
+          throw new Error(`Unexpected contract method ${invokedMethod(tx)}`);
+      }
+    });
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toThrow(
+      /manages .* units but has no shares in circulation/,
+    );
+  });
+
+  it("classifies validation errors as kind 'validation'", async () => {
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, "abc"),
+    ).rejects.toMatchObject({ kind: "validation" });
+  });
+
+  it("classifies configuration errors as kind 'configuration'", async () => {
+    delete process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toMatchObject({ kind: "configuration" });
+  });
+
+  it("classifies RPC failures as kind 'upstream'", async () => {
+    mockSimulateTransaction.mockRejectedValue(new Error("rpc exploded"));
+
+    await expect(
+      DefindexService.calculateDepositParams(USER_ADDRESS, DEPOSIT_AMOUNT),
+    ).rejects.toMatchObject({ kind: "upstream" });
+  });
+});

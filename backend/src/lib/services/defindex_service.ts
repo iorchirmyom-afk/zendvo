@@ -22,6 +22,22 @@ import {
   xdr,
 } from "@stellar/stellar-sdk";
 
+/** Results of a DeFindex deposit parameter calculation. */
+export interface DepositParams {
+  userAddress: string;
+  amount: string;
+  estimatedShares: string;
+  sharePrice: string;
+  userBalance: string;
+  totalManagedFunds: string;
+  totalSupply: string;
+  contractId: string;
+  networkPassphrase: string;
+  rpcUrl: string;
+  unsignedXdr: string;
+  txHash: string;
+}
+
 /** Results of a DeFindex withdrawal parameter calculation. */
 export interface WithdrawalParams {
   /** Stellar address that owns the vault shares and signs the withdrawal. */
@@ -60,9 +76,16 @@ export interface WithdrawalParams {
   txHash: string;
 }
 
+/** Classifies the source of a DeFindex error for API error mapping. */
+export type DefindexServiceErrorKind =
+  | "validation"
+  | "configuration"
+  | "upstream";
+
 export class DefindexServiceError extends Error {
   constructor(
     message: string,
+    public readonly kind: DefindexServiceErrorKind = "validation",
     public readonly cause?: Error,
   ) {
     super(message);
@@ -105,6 +128,7 @@ export class DefindexService {
     if (!StrKey.isValidEd25519PublicKey(userAddress)) {
       throw new DefindexServiceError(
         `Invalid user address "${userAddress}": expected a valid Stellar G... public key`,
+        "validation",
       );
     }
 
@@ -114,17 +138,20 @@ export class DefindexService {
     } catch {
       throw new DefindexServiceError(
         `Invalid withdrawal amount "${amount}": must be a positive integer in smallest units`,
+        "validation",
       );
     }
     if (amountN <= 0n) {
       throw new DefindexServiceError(
         `Invalid withdrawal amount "${amount}": must be greater than zero`,
+        "validation",
       );
     }
 
     if (!contractId || !StrKey.isValidContract(contractId)) {
       throw new DefindexServiceError(
         "DEFINDEX_VAULT_CONTRACT_ID is not configured: expected a valid Stellar C... contract address",
+        "configuration",
       );
     }
 
@@ -180,6 +207,7 @@ export class DefindexService {
       if (managedFunds.length === 0) {
         throw new DefindexServiceError(
           `Vault ${contractId} reports no managed assets; cannot calculate withdrawal parameters`,
+          "upstream",
         );
       }
 
@@ -191,11 +219,13 @@ export class DefindexService {
       if (totalSupply <= 0n) {
         throw new DefindexServiceError(
           `Vault ${contractId} has no shares in circulation; cannot calculate a share price`,
+          "upstream",
         );
       }
       if (totalManagedFunds <= 0n) {
         throw new DefindexServiceError(
           `Vault ${contractId} manages no USDC funds; nothing to withdraw`,
+          "upstream",
         );
       }
 
@@ -210,6 +240,7 @@ export class DefindexService {
       if (amountN > maxWithdrawable) {
         throw new DefindexServiceError(
           `Insufficient vault balance: user ${userAddress} can withdraw at most ${maxWithdrawable} units but ${amountN} was requested`,
+          "validation",
         );
       }
 
@@ -220,6 +251,7 @@ export class DefindexService {
       if (sharesToBurn > userBalance) {
         throw new DefindexServiceError(
           `Insufficient vault shares: ${sharesToBurn} shares required but user holds ${userBalance}`,
+          "validation",
         );
       }
 
@@ -266,6 +298,7 @@ export class DefindexService {
           if (simulationError) {
             throw new DefindexServiceError(
               `Withdrawal simulation failed for vault ${contractId}: ${simulationError}`,
+              "upstream",
             );
           }
         }
@@ -300,6 +333,7 @@ export class DefindexService {
       const err = error instanceof Error ? error : new Error(String(error));
       throw new DefindexServiceError(
         `Failed to calculate DeFindex withdrawal parameters for ${userAddress}: ${err.message}`,
+        "upstream",
         err,
       );
     }
@@ -342,13 +376,200 @@ export class DefindexService {
         `Failed to query ${method} on vault ${contractId}${
           simulationError ? `: ${simulationError}` : ""
         }`,
+        "upstream",
       );
     }
     return simulation.result.retval;
   }
 
-  // TODO: Connect to Soroban RPC / DeFindex SDK to build payload
-  static async calculateDepositXdr(userAddress: string, amount: string): Promise<string> {
-    return "base64_unsigned_xdr_placeholder";
+  static async calculateDepositParams(
+    userAddress: string,
+    amount: string,
+  ): Promise<DepositParams> {
+    const contractId = process.env.DEFINDEX_VAULT_CONTRACT_ID;
+    const rpcUrl =
+      process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
+    const networkPassphrase =
+      process.env.STELLAR_NETWORK_PASSPHRASE || Networks.TESTNET;
+
+    if (!StrKey.isValidEd25519PublicKey(userAddress)) {
+      throw new DefindexServiceError(
+        `Invalid user address "${userAddress}": expected a valid Stellar G... public key`,
+        "validation",
+      );
+    }
+
+    let amountN: bigint;
+    try {
+      amountN = BigInt(amount);
+    } catch {
+      throw new DefindexServiceError(
+        `Invalid deposit amount "${amount}": must be a positive integer in smallest units`,
+        "validation",
+      );
+    }
+    if (amountN <= 0n) {
+      throw new DefindexServiceError(
+        `Invalid deposit amount "${amount}": must be greater than zero`,
+        "validation",
+      );
+    }
+
+    if (!contractId || !StrKey.isValidContract(contractId)) {
+      throw new DefindexServiceError(
+        "DEFINDEX_VAULT_CONTRACT_ID is not configured: expected a valid Stellar C... contract address",
+        "configuration",
+      );
+    }
+
+    const server = new rpc.Server(rpcUrl);
+
+    try {
+      const totalSupply = BigInt(
+        scValToNative(
+          await DefindexService.queryVault(
+            server,
+            contractId,
+            "total_supply",
+            [],
+            userAddress,
+            networkPassphrase,
+          ),
+        ) as bigint,
+      );
+
+      const managedFunds = scValToNative(
+        await DefindexService.queryVault(
+          server,
+          contractId,
+          "fetch_total_managed_funds",
+          [],
+          userAddress,
+          networkPassphrase,
+        ),
+      ) as Array<{
+        asset: string;
+        total_amount: bigint;
+        idle_amount: bigint;
+        invested_amount: bigint;
+        strategy_allocations: unknown[];
+      }>;
+
+      if (managedFunds.length === 0) {
+        throw new DefindexServiceError(
+          `Vault ${contractId} reports no managed assets; cannot calculate deposit parameters`,
+          "upstream",
+        );
+      }
+
+      const totalManagedFunds = managedFunds.reduce(
+        (sum, asset) => sum + BigInt(asset.total_amount),
+        0n,
+      );
+
+      // A vault with no shares and no managed funds reports an inconsistent
+      // state; only a genuinely new vault (both zero) uses the 1:1 fallback.
+      if (totalSupply <= 0n && totalManagedFunds > 0n) {
+        throw new DefindexServiceError(
+          `Vault ${contractId} manages ${totalManagedFunds} units but has no shares in circulation; cannot calculate deposit parameters`,
+          "upstream",
+        );
+      }
+      if (totalManagedFunds <= 0n && totalSupply > 0n) {
+        throw new DefindexServiceError(
+          `Vault ${contractId} has shares in circulation but manages no USDC funds; cannot calculate deposit parameters`,
+          "upstream",
+        );
+      }
+
+      let sharePrice: bigint;
+      let estimatedShares: bigint;
+
+      if (totalSupply <= 0n) {
+        sharePrice = 10n ** 7n;
+        estimatedShares = amountN;
+      } else {
+        sharePrice = (totalManagedFunds * 10n ** 7n) / totalSupply;
+        estimatedShares =
+          (amountN * totalSupply) / totalManagedFunds;
+      }
+
+      const userBalance = BigInt(
+        scValToNative(
+          await DefindexService.queryVault(
+            server,
+            contractId,
+            "balance_of",
+            [Address.fromString(userAddress).toScVal()],
+            userAddress,
+            networkPassphrase,
+          ),
+        ) as bigint,
+      );
+
+      const contract = new Contract(contractId);
+      const depositOp = contract.call(
+        "deposit",
+        nativeToScVal(amountN, { type: "i128" }),
+        Address.fromString(userAddress).toScVal(),
+      );
+
+      const sourceAccount = new Account(userAddress, "0");
+      const tx = new TransactionBuilder(sourceAccount, {
+        fee: "100",
+        networkPassphrase,
+      })
+        .addOperation(depositOp)
+        .setTimeout(30)
+        .setSorobanData(new SorobanDataBuilder().build())
+        .build();
+
+      let finalTx = tx;
+      try {
+        const simulation = await server.simulateTransaction(tx);
+        if (simulation && !("error" in simulation) && simulation.transactionData) {
+          finalTx = rpc.assembleTransaction(tx, simulation).build();
+        } else {
+          const simulationError = (simulation as rpc.Api.SimulateTransactionErrorResponse)
+            ?.error;
+          if (simulationError) {
+            throw new DefindexServiceError(
+              `Deposit simulation failed for vault ${contractId}: ${simulationError}`,
+              "upstream",
+            );
+          }
+        }
+      } catch (error) {
+        if (error instanceof DefindexServiceError) {
+          throw error;
+        }
+        finalTx = tx;
+      }
+
+      return {
+        userAddress,
+        amount: amountN.toString(),
+        estimatedShares: estimatedShares.toString(),
+        sharePrice: sharePrice.toString(),
+        userBalance: userBalance.toString(),
+        totalManagedFunds: totalManagedFunds.toString(),
+        totalSupply: totalSupply.toString(),
+        contractId,
+        networkPassphrase,
+        rpcUrl,
+        unsignedXdr: finalTx.toXDR(),
+        txHash: finalTx.hash().toString("hex"),
+      };
+    } catch (error) {
+      if (error instanceof DefindexServiceError) {
+        throw error;
+      }
+      const err = error instanceof Error ? error : new Error(String(error));
+      throw new DefindexServiceError(
+        `Failed to calculate DeFindex deposit parameters for ${userAddress}: ${err.message}`,
+        "upstream",
+        err,
+      );
+    }
   }
 }
