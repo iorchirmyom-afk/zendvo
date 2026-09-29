@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
         "about:blank",
         "Bad Request",
         400,
-        "amount is required and must be a string of the deposit amount in smallest units",
+        "amount is required and must be a human-readable USDC amount string (for example, 50.00)",
       );
     }
 
@@ -58,7 +58,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const result = await DefindexService.calculateDepositParams(
+    const result = await DefindexService.buildDeFindexDepositXdr(
       user.stellarAddress,
       amount.trim(),
     );
@@ -83,7 +83,7 @@ export async function POST(request: NextRequest) {
             "about:blank",
             "Bad Gateway",
             502,
-            "The DeFindex vault could not be reached at this time",
+            "The DeFindex vault could not be reached or simulated at this time",
           );
         case "validation":
         default:
@@ -99,7 +99,7 @@ export async function POST(request: NextRequest) {
       "about:blank",
       "Internal Server Error",
       500,
-      "Failed to calculate deposit parameters",
+      "Failed to build DeFindex deposit transaction",
     );
   }
 }

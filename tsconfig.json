@@ -15,8 +15,7 @@
     "paths": {
       "@/app/api/*": ["./src/api/*"],
       "@/*": ["./src/*"]
-    },
-    "types": ["node", "jest"]
+    }
   },
   "include": [
     "backend/src/**/*",

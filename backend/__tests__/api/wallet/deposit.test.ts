@@ -5,6 +5,16 @@ import { DefindexService, DefindexServiceError } from "@/lib/services/defindex_s
 
 const VALID_STELLAR_ADDRESS = "GDWF77422SKLZTBQT77BQEQLCIQY6PFTFZX5OFJTLAFFWJ2PK5WBOZAN";
 
+jest.mock("@defindex/sdk", () => ({
+  DefindexSDK: jest.fn().mockImplementation(() => ({
+    getVaultInfo: jest.fn(),
+    getVaultAPY: jest.fn(),
+    depositToVault: jest.fn(),
+    withdrawFromVault: jest.fn(),
+  })),
+  SupportedNetworks: { TESTNET: "testnet", MAINNET: "mainnet" },
+}));
+
 jest.mock("@/lib/auth-session", () => ({
   getAuthPayload: jest.fn(),
 }));
@@ -40,20 +50,20 @@ jest.mock("@/lib/services/defindex_service", () => {
   return {
     ...actual,
     DefindexService: {
-      calculateDepositParams: jest.fn(),
+      buildDeFindexDepositXdr: jest.fn(),
     },
   };
 });
 
 const mockGetAuthPayload = getAuthPayload as jest.Mock;
-const mockCalculateDepositParams = (
+const mockBuildDeFindexDepositXdr = (
   DefindexService as jest.Mocked<typeof DefindexService>
-).calculateDepositParams as jest.Mock;
+).buildDeFindexDepositXdr as jest.Mock;
 const { __mocks } = require("@/lib/db");
 
 const MOCK_RESULT = {
   userAddress: VALID_STELLAR_ADDRESS,
-  amount: "100000000",
+  amount: "500000000",
   estimatedShares: "100",
   sharePrice: "10000000",
   userBalance: "0",
@@ -131,9 +141,9 @@ describe("POST /api/wallet/deposit", () => {
     __mocks.selectWhere.mockResolvedValueOnce([
       { stellarAddress: VALID_STELLAR_ADDRESS },
     ]);
-    mockCalculateDepositParams.mockResolvedValueOnce(MOCK_RESULT);
+    mockBuildDeFindexDepositXdr.mockResolvedValueOnce(MOCK_RESULT);
 
-    const res = await POST(makeRequest({ amount: "100000000" }));
+    const res = await POST(makeRequest({ amount: "50.00" }));
     const body = await res.json();
 
     expect(res.status).toBe(200);
@@ -141,9 +151,9 @@ describe("POST /api/wallet/deposit", () => {
     expect(body.unsignedXdr).toBe(MOCK_RESULT.unsignedXdr);
     expect(body.estimatedShares).toBe("100");
     expect(body.txHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(mockCalculateDepositParams).toHaveBeenCalledWith(
+    expect(mockBuildDeFindexDepositXdr).toHaveBeenCalledWith(
       VALID_STELLAR_ADDRESS,
-      "100000000",
+      "50.00",
     );
   });
 
@@ -152,9 +162,9 @@ describe("POST /api/wallet/deposit", () => {
     __mocks.selectWhere.mockResolvedValueOnce([
       { stellarAddress: VALID_STELLAR_ADDRESS },
     ]);
-    mockCalculateDepositParams.mockRejectedValueOnce(
+    mockBuildDeFindexDepositXdr.mockRejectedValueOnce(
       new DefindexServiceError(
-        "Invalid deposit amount \"-5\": must be greater than zero",
+        "Invalid USDC amount \"-5\": must be greater than zero",
         "validation",
       ),
     );
@@ -164,7 +174,7 @@ describe("POST /api/wallet/deposit", () => {
 
     expect(res.status).toBe(400);
     expect(body.title).toBe("Bad Request");
-    expect(body.detail).toContain("Invalid deposit amount");
+    expect(body.detail).toContain("Invalid USDC amount");
   });
 
   it("returns 500 without exposing internals when the service reports a configuration error", async () => {
@@ -172,7 +182,7 @@ describe("POST /api/wallet/deposit", () => {
     __mocks.selectWhere.mockResolvedValueOnce([
       { stellarAddress: VALID_STELLAR_ADDRESS },
     ]);
-    mockCalculateDepositParams.mockRejectedValueOnce(
+    mockBuildDeFindexDepositXdr.mockRejectedValueOnce(
       new DefindexServiceError(
         "DEFINDEX_VAULT_CONTRACT_ID is not configured",
         "configuration",
@@ -192,7 +202,7 @@ describe("POST /api/wallet/deposit", () => {
     __mocks.selectWhere.mockResolvedValueOnce([
       { stellarAddress: VALID_STELLAR_ADDRESS },
     ]);
-    mockCalculateDepositParams.mockRejectedValueOnce(
+    mockBuildDeFindexDepositXdr.mockRejectedValueOnce(
       new DefindexServiceError(
         "Failed to query total_supply on vault: HostError: contract invocation failed",
         "upstream",
@@ -204,6 +214,9 @@ describe("POST /api/wallet/deposit", () => {
 
     expect(res.status).toBe(502);
     expect(body.title).toBe("Bad Gateway");
+    expect(body.detail).toBe(
+      "The DeFindex vault could not be reached or simulated at this time",
+    );
     expect(body.detail).not.toContain("HostError");
   });
 

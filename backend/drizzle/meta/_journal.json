@@ -57,6 +57,13 @@
       "when": 1756444800000,
       "tag": "0007_savings_history",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1787331600000,
+      "tag": "0008_transaction_verification",
+      "breakpoints": true
     }
   ]
 }

@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- The SEP-24 anchor deposit flow loads the anchor's interactive page in
+         an in-app WebView and calls the Zendvo backend, so release builds need
+         network access (the debug manifest already declares this). -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <application
         android:label="mobile"
         android:name="${applicationName}"

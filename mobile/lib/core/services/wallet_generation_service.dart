@@ -1,8 +1,21 @@
-// Placeholder: Wallet Generation Service
-// Generates a valid Ed25519 Stellar KeyPair locally.
+import 'package:stellar_flutter_sdk/stellar_flutter_sdk.dart';
+
+class WalletCredentials {
+  final String accountId;
+  final String secretSeed;
+
+  WalletCredentials({
+    required this.accountId,
+    required this.secretSeed,
+  });
+}
+
 class WalletGenerationService {
-  Future<Map<String, String>> generateKeyPair() async {
-    // TODO: Implement stellar_flutter_sdk KeyPair.random()
-    return {'accountId': 'placeholder', 'secretSeed': 'placeholder'};
+  WalletCredentials generateKeyPair() {
+    final keyPair = KeyPair.random();
+    return WalletCredentials(
+      accountId: keyPair.accountId,
+      secretSeed: keyPair.secretSeed,
+    );
   }
 }

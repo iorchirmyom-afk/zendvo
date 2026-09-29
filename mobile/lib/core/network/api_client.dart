@@ -120,15 +120,87 @@ class ApiClient {
     );
   }
 
+  /// GETs [url] and decodes the JSON body, retrying transient failures with
+  /// exponential backoff exactly like [postWithRetry].
+  ///
+  /// Used by read-only polling (e.g. SEP-24 transaction status). Transient
+  /// failures (transport errors, timeouts, HTTP 408/429/5xx) are retried;
+  /// other 4xx answers fail immediately because retrying cannot change them,
+  /// and both surface as the same mapped domain exceptions thrown by
+  /// [postWithRetry].
+  Future<Map<String, dynamic>> getWithRetry(
+    String url, {
+    Map<String, String>? headers,
+  }) async {
+    var attempt = 0;
+    Object? lastError;
+
+    while (attempt < maxRetries) {
+      attempt++;
+      try {
+        return await _getOnce(url, headers: headers);
+      } on IOException catch (error) {
+        lastError = error;
+      } on TimeoutException catch (error) {
+        lastError = error;
+      } on ApiException catch (error) {
+        lastError = error;
+        // Client-side errors other than congestion will not change between
+        // attempts (e.g. an unknown transaction id answering 404 every time).
+        if (error.statusCode != null &&
+            error.statusCode! >= 400 &&
+            error.statusCode! < 500 &&
+            error is! NetworkCongestedException) {
+          rethrow;
+        }
+      }
+
+      if (attempt < maxRetries) {
+        await Future<void>.delayed(_backoffDelay(attempt));
+      }
+    }
+
+    int? lastStatusCode;
+    if (lastError is ApiException) {
+      lastStatusCode = lastError.statusCode;
+    }
+    throw NetworkCongestedException(
+      'The network is temporarily congested. Please try again shortly.',
+      statusCode: lastStatusCode,
+      cause: lastError,
+    );
+  }
+
   /// Performs a single POST request and maps the response/errors.
   Future<Map<String, dynamic>> _postOnce(
     String url,
     Map<String, dynamic> body, {
     Map<String, String>? headers,
   }) async {
-    final uri = Uri.parse(url);
-    final request = await _httpClient.postUrl(uri);
+    final request = await _httpClient.postUrl(Uri.parse(url));
     request.headers.contentType = ContentType.json;
+    await _prepareHeaders(request, headers);
+    request.add(utf8.encode(jsonEncode(body)));
+
+    return _readResponse(request);
+  }
+
+  /// Performs a single GET request and maps the response/errors.
+  Future<Map<String, dynamic>> _getOnce(
+    String url, {
+    Map<String, String>? headers,
+  }) async {
+    final request = await _httpClient.getUrl(Uri.parse(url));
+    await _prepareHeaders(request, headers);
+
+    return _readResponse(request);
+  }
+
+  /// Attaches the bearer token (when available) and any per-call headers.
+  Future<void> _prepareHeaders(
+    HttpClientRequest request,
+    Map<String, String>? headers,
+  ) async {
     final token = await authTokenProvider?.call();
     if (token != null && token.isNotEmpty) {
       request.headers.set(HttpHeaders.authorizationHeader, 'Bearer $token');
@@ -136,12 +208,19 @@ class ApiClient {
     headers?.forEach((key, value) {
       request.headers.set(key, value);
     });
-    request.add(utf8.encode(jsonEncode(body)));
+  }
 
+  /// Closes [request], reads the body and maps a non-success status to a
+  /// domain exception.
+  Future<Map<String, dynamic>> _readResponse(HttpClientRequest request) async {
     final response = await request.close().timeout(requestTimeout);
     final responseBody = await response.transform(utf8.decoder).join().timeout(requestTimeout);
-    final statusCode = response.statusCode;
+    return _mapResponse(response.statusCode, responseBody);
+  }
 
+  /// Maps an HTTP status/body pair to either a decoded body or a domain
+  /// exception.
+  Map<String, dynamic> _mapResponse(int statusCode, String responseBody) {
     if (statusCode >= 200 && statusCode < 300) {
       return _decodeBody(responseBody);
     }

@@ -27,7 +27,12 @@ Future<(HttpServer, Uri)> startServer(Future<void> Function(HttpRequest) handler
 }
 
 Future<void> jsonResponse(HttpRequest request, int statusCode, Map<String, dynamic> body) async {
-  await request.drain<void>();
+  try {
+    await request.drain<void>();
+  } on StateError {
+    // The handler above already consumed the request body to assert on it;
+    // draining it a second time throws "Stream has already been listened to".
+  }
   request.response
     ..statusCode = statusCode
     ..headers.contentType = ContentType.json

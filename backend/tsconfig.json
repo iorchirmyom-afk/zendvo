@@ -13,8 +13,7 @@
     "paths": {
       "@/app/api/*": ["./src/api/*"],
       "@/*": ["./src/*"]
-    },
-    "types": ["node", "jest"]
+    }
   },
   "include": ["src/**/*", "__tests__/**/*"],
   "exclude": ["node_modules", "dist"]
